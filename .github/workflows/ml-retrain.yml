@@ -1,0 +1,106 @@
+name: ML Model Retraining
+
+on:
+  schedule:
+    # Every Sunday at 2am UTC
+    - cron: "0 2 * * 0"
+  workflow_dispatch:
+    inputs:
+      force_retrain:
+        description: "Force retrain even if no drift detected"
+        required: false
+        default: "false"
+
+jobs:
+  check-drift:
+    name: Check Model Drift
+    runs-on: ubuntu-latest
+    outputs:
+      needs_retrain: ${{ steps.drift.outputs.needs_retrain }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install numpy pandas scikit-learn
+
+      - name: Run drift check
+        id: drift
+        env:
+          FORCE_RETRAIN: ${{ github.event.inputs.force_retrain }}
+        run: |
+          if [ "$FORCE_RETRAIN" = "true" ]; then
+            echo "needs_retrain=true" >> $GITHUB_OUTPUT
+            echo "Force retrain requested"
+          else
+            python ml/src/monitoring/drift_detector.py 2>&1 | tee drift_output.txt
+            if grep -q "RETRAIN" drift_output.txt; then
+              echo "needs_retrain=true" >> $GITHUB_OUTPUT
+              echo "Drift detected — retraining required"
+            else
+              echo "needs_retrain=false" >> $GITHUB_OUTPUT
+              echo "No drift detected — skipping retraining"
+            fi
+          fi
+
+  retrain:
+    name: Retrain Models
+    runs-on: ubuntu-latest
+    needs: check-drift
+    if: needs.check-drift.outputs.needs_retrain == 'true'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ML dependencies
+        run: pip install numpy pandas scikit-learn xgboost mlflow
+
+      - name: Generate fresh training data
+        run: |
+          mkdir -p ml/data/processed
+          python ml/data/generate_data.py \
+            --n-users 200 \
+            --transactions-per-user 500 \
+            --output ml/data/processed/transactions.csv
+
+      - name: Train categorizer
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+        run: python -m ml.src.training.train_categorizer
+
+      - name: Train forecaster
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+        run: python -m ml.src.training.train_forecaster
+
+      - name: Train anomaly detector
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+        run: python -m ml.src.training.train_anomaly
+
+      - name: Upload models to S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          aws s3 cp ml/models/ s3://${{ secrets.ML_MODELS_S3_BUCKET }}/models/$(date +%Y%m%d)/ --recursive
+          aws s3 cp ml/models/ s3://${{ secrets.ML_MODELS_S3_BUCKET }}/models/latest/ --recursive
+          echo "Models uploaded to S3"
+
+      - name: Trigger ML service redeployment
+        run: |
+          aws ecs update-service \
+            --cluster finsight-staging \
+            --service finsight-ml \
+            --force-new-deployment \
+            --region us-east-1

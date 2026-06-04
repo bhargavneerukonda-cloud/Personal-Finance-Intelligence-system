@@ -1,0 +1,95 @@
+name: Deploy to Staging
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+  BACKEND_IMAGE: finsight-backend
+  ML_IMAGE: finsight-ml
+
+jobs:
+  deploy-staging:
+    name: Deploy to AWS ECS Staging
+    runs-on: ubuntu-latest
+    environment: staging
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push backend image
+        run: |
+          IMAGE_TAG="${{ github.sha }}"
+          docker build -t $ECR_REGISTRY/$BACKEND_IMAGE:$IMAGE_TAG ./backend
+          docker build -t $ECR_REGISTRY/$BACKEND_IMAGE:staging ./backend
+          docker push $ECR_REGISTRY/$BACKEND_IMAGE:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$BACKEND_IMAGE:staging
+          echo "BACKEND_IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+
+      - name: Build and push ML image
+        run: |
+          IMAGE_TAG="${{ github.sha }}"
+          docker build -t $ECR_REGISTRY/$ML_IMAGE:$IMAGE_TAG ./ml
+          docker build -t $ECR_REGISTRY/$ML_IMAGE:staging ./ml
+          docker push $ECR_REGISTRY/$ML_IMAGE:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ML_IMAGE:staging
+
+      - name: Build and deploy frontend to S3
+        run: |
+          cd frontend
+          npm ci
+          VITE_API_URL=${{ secrets.STAGING_API_URL }} npm run build
+          aws s3 sync dist/ s3://${{ secrets.STAGING_S3_BUCKET }} --delete
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.STAGING_CF_DISTRIBUTION }} \
+            --paths "/*"
+
+      - name: Update ECS backend service
+        run: |
+          aws ecs update-service \
+            --cluster finsight-staging \
+            --service finsight-backend \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Update ECS ML service
+        run: |
+          aws ecs update-service \
+            --cluster finsight-staging \
+            --service finsight-ml \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Wait for services to stabilize
+        run: |
+          aws ecs wait services-stable \
+            --cluster finsight-staging \
+            --services finsight-backend finsight-ml \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Smoke test staging
+        run: |
+          sleep 10
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" ${{ secrets.STAGING_API_URL }}/health)
+          if [ "$STATUS" != "200" ]; then
+            echo "Staging health check failed with status $STATUS"
+            exit 1
+          fi
+          echo "✓ Staging health check passed"
+
+      - name: Notify on failure
+        if: failure()
+        run: echo "Staging deployment failed — check ECS logs"
